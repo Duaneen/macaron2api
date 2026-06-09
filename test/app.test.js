@@ -21,6 +21,55 @@ test("requires auth when API_KEY is configured", async () => {
   }
 });
 
+test("accepts x-api-key auth and returns request diagnostic headers", async () => {
+  const upstream = await startMockUpstream();
+  const app = await startApp(upstream.origin, { localApiKey: "test-secret" });
+
+  try {
+    const res = await fetch(`${app.origin}/v1/chat/completions`, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        "x-api-key": "test-secret",
+        "x-request-id": "req-123",
+      },
+      body: JSON.stringify({
+        model: "macaron-v1-preview-b200",
+        messages: [{ role: "user", content: "hello" }],
+      }),
+    });
+    await res.json();
+
+    assert.equal(res.status, 200);
+    assert.equal(res.headers.get("x-request-id"), "req-123");
+    assert.equal(res.headers.get("x-macaron-upstream"), `${upstream.origin}/api/inline-chat`);
+    assert.match(res.headers.get("access-control-expose-headers"), /x-request-id/);
+    assert.match(res.headers.get("access-control-expose-headers"), /x-macaron-upstream/);
+  } finally {
+    await app.close();
+    await upstream.close();
+  }
+});
+
+test("allows x-request-id on CORS preflight", async () => {
+  const app = await startApp("http://127.0.0.1:9");
+
+  try {
+    const res = await fetch(`${app.origin}/v1/chat/completions`, {
+      method: "OPTIONS",
+      headers: {
+        origin: "http://example.test",
+        "access-control-request-headers": "x-request-id",
+      },
+    });
+
+    assert.equal(res.status, 204);
+    assert.match(res.headers.get("access-control-allow-headers"), /x-request-id/);
+  } finally {
+    await app.close();
+  }
+});
+
 test("lists models and returns model details", async () => {
   const upstream = await startMockUpstream();
   const app = await startApp(upstream.origin, { localApiKey: "test-secret" });
@@ -126,6 +175,68 @@ test("proxies raw Macaron NDJSON and routes non-Macaron models to plain chat", a
   }
 });
 
+test("forwards sampling params and tools to the upstream", async () => {
+  const upstream = await startMockUpstream();
+  const app = await startApp(upstream.origin, { localApiKey: "test-secret" });
+
+  try {
+    const res = await fetch(`${app.origin}/v1/chat/completions`, {
+      method: "POST",
+      headers: { ...AUTH, "content-type": "application/json" },
+      body: JSON.stringify({
+        model: "macaron-v1-preview-b200",
+        temperature: 0.5,
+        max_tokens: 64,
+        tools: [{ type: "function", function: { name: "ping" } }],
+        messages: [{ role: "user", content: "hello" }],
+      }),
+    });
+    await res.json();
+
+    assert.equal(res.status, 200);
+    const forwarded = upstream.requests.at(-1).body;
+    assert.equal(forwarded.temperature, 0.5);
+    assert.equal(forwarded.max_tokens, 64);
+    assert.deepEqual(forwarded.tools, [{ type: "function", function: { name: "ping" } }]);
+  } finally {
+    await app.close();
+    await upstream.close();
+  }
+});
+
+test("streams a valid finish_reason and an error field on upstream error", async () => {
+  const upstream = await startMockUpstream({
+    events: [
+      { type: "text-delta", text: "partial" },
+      { type: "error", error: "upstream blew up" },
+    ],
+  });
+  const app = await startApp(upstream.origin, { localApiKey: "test-secret" });
+
+  try {
+    const res = await fetch(`${app.origin}/v1/chat/completions`, {
+      method: "POST",
+      headers: { ...AUTH, "content-type": "application/json" },
+      body: JSON.stringify({
+        model: "macaron-v1-preview-b200",
+        stream: true,
+        messages: [{ role: "user", content: "hello" }],
+      }),
+    });
+    const text = await res.text();
+
+    assert.equal(res.status, 200);
+    assert.match(text, /"message":"upstream blew up"/);
+    // finish_reason must never be the non-standard "error" value.
+    assert.doesNotMatch(text, /"finish_reason":"error"/);
+    assert.match(text, /"finish_reason":"stop"/);
+    assert.match(text, /data: \[DONE\]/);
+  } finally {
+    await app.close();
+    await upstream.close();
+  }
+});
+
 test("rejects invalid chat completion payloads", async () => {
   const upstream = await startMockUpstream();
   const app = await startApp(upstream.origin, { localApiKey: "test-secret" });
@@ -146,7 +257,117 @@ test("rejects invalid chat completion payloads", async () => {
   }
 });
 
-async function startMockUpstream() {
+test("rejects malformed message entries as client errors", async () => {
+  const upstream = await startMockUpstream();
+  const app = await startApp(upstream.origin, { localApiKey: "test-secret" });
+
+  try {
+    const res = await fetch(`${app.origin}/v1/chat/completions`, {
+      method: "POST",
+      headers: { ...AUTH, "content-type": "application/json" },
+      body: JSON.stringify({
+        model: "macaron-v1-preview-b200",
+        messages: [null],
+      }),
+    });
+    const body = await res.json();
+
+    assert.equal(res.status, 400);
+    assert.equal(body.error.type, "invalid_request_error");
+    assert.match(body.error.message, /messages\[0\]/);
+  } finally {
+    await app.close();
+    await upstream.close();
+  }
+});
+
+test("reports upstream fetch failures as upstream errors", async () => {
+  const app = await startApp("http://upstream.test", {
+    localApiKey: "test-secret",
+    fetchImpl: async () => {
+      throw new Error("network down");
+    },
+  });
+
+  try {
+    const res = await fetch(`${app.origin}/v1/chat/completions`, {
+      method: "POST",
+      headers: { ...AUTH, "content-type": "application/json" },
+      body: JSON.stringify({
+        model: "macaron-v1-preview-b200",
+        messages: [{ role: "user", content: "hello" }],
+      }),
+    });
+    const body = await res.json();
+
+    assert.equal(res.status, 502);
+    assert.equal(body.error.type, "upstream_error");
+    assert.match(body.error.message, /network down/);
+  } finally {
+    await app.close();
+  }
+});
+
+test("reports malformed upstream NDJSON as upstream errors", async () => {
+  const upstream = await startMockUpstream({ rawResponse: "not-json\n" });
+  const app = await startApp(upstream.origin, { localApiKey: "test-secret" });
+
+  try {
+    const res = await fetch(`${app.origin}/v1/chat/completions`, {
+      method: "POST",
+      headers: { ...AUTH, "content-type": "application/json" },
+      body: JSON.stringify({
+        model: "macaron-v1-preview-b200",
+        messages: [{ role: "user", content: "hello" }],
+      }),
+    });
+    const body = await res.json();
+
+    assert.equal(res.status, 502);
+    assert.equal(body.error.type, "upstream_error");
+    assert.match(body.error.message, /Invalid NDJSON/);
+  } finally {
+    await app.close();
+    await upstream.close();
+  }
+});
+
+test("enforces request body limit by utf8 byte length", async () => {
+  const raw = JSON.stringify({
+    model: "macaron-v1-preview-b200",
+    messages: [{ role: "user", content: "你好你好你好" }],
+  });
+  const maxBodyBytes = raw.length + 1;
+  const app = await startApp("http://127.0.0.1:9", {
+    localApiKey: "test-secret",
+    maxBodyBytes,
+  });
+
+  assert.ok(Buffer.byteLength(raw, "utf8") > maxBodyBytes);
+
+  try {
+    const res = await fetch(`${app.origin}/v1/chat/completions`, {
+      method: "POST",
+      headers: { ...AUTH, "content-type": "application/json" },
+      body: raw,
+    });
+    const body = await res.json();
+
+    assert.equal(res.status, 413);
+    assert.match(body.error.message, new RegExp(`Limit is ${maxBodyBytes} bytes`));
+  } finally {
+    await app.close();
+  }
+});
+
+async function startMockUpstream(options = {}) {
+  const events = options.events ?? [
+    { type: "step-start" },
+    { type: "text-delta", text: "Hello " },
+    { type: "text-delta", text: "from Macaron." },
+    { type: "step-finish", usage: { inputTokens: 3, outputTokens: 4, totalTokens: 7 } },
+    { type: "done" },
+  ];
   const requests = [];
   const server = http.createServer(async (req, res) => {
     const raw = await readRequestBody(req);
@@ -162,17 +383,12 @@ async function startMockUpstream() {
     }
 
     res.writeHead(200, { "content-type": "application/x-ndjson; charset=utf-8" });
-    res.end(
-      [
-        { type: "step-start" },
-        { type: "text-delta", text: "Hello " },
-        { type: "text-delta", text: "from Macaron." },
-        { type: "step-finish", usage: { inputTokens: 3, outputTokens: 4, totalTokens: 7 } },
-        { type: "done" },
-      ]
-        .map((event) => JSON.stringify(event))
-        .join("\n") + "\n",
-    );
+    if (options.rawResponse !== undefined) {
+      res.end(options.rawResponse);
+      return;
+    }
+
+    res.end(events.map((event) => JSON.stringify(event)).join("\n") + "\n");
   });
 
   const origin = await listen(server);

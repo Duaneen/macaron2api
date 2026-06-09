@@ -6,7 +6,8 @@
   "description": "OpenAI-compatible API proxy for macaron-model-previews.macaron.im.",
   "scripts": {
     "start": "node src/server.js",
-    "check": "node --check src/server.js && node --check src/app.js && node --check src/startup.js && node --check test/app.test.js && node --check test/startup.test.js",
+    "check": "node --check src/server.js && node --check src/app.js && node --check src/startup.js && node --check scripts/inspect-upstream.mjs && node --check test/app.test.js && node --check test/startup.test.js",
+    "inspect:upstream": "node scripts/inspect-upstream.mjs",
     "test": "node --test"
   },
   "engines": {

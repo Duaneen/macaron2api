@@ -69,6 +69,24 @@ x-macaron-upstream-api-key
 x-macaron-upstream-base-url
 ```
 
+## 参数透传
+
+以下 OpenAI 采样参数会原样转发给上游（是否生效取决于上游，未知字段预期会被忽略）：
+
+`temperature`、`top_p`、`max_tokens`、`stop`、`frequency_penalty`、`presence_penalty`、`seed`
+
+`tools` 与 `tool_choice` 也会一并转发。但工具调用能否端到端工作，取决于上游 Macaron 接口本身是否支持函数调用，以及其返回的事件格式——当前代理只做请求侧透传，尚未对上游的工具调用返回做解析。
+
+## 上游协议逆向
+
+可以用以下命令从真实预览页面抽取当前 bundle 里的端点、模型 ID 和 NDJSON 事件类型：
+
+```powershell
+npm run inspect:upstream
+```
+
+当前页面会向 `/api/inline-chat` 与 `/api/plain-chat` 发送 JSON 请求，上游以 NDJSON 返回事件。已观察到的事件类型包括 `text-delta`、`reasoning-start`、`reasoning-delta`、`tool-input`、`tsx-preview`、`web-search`、`tool-error`、`error`、`done`。OpenAI 兼容层目前只把文本、reasoning、usage 和错误转换为 Chat Completions 形态；工具输入、TSX 预览和搜索事件仍只适合通过 `/api/chat` 原始代理观察。
+
 ## OpenAI 兼容用法
 
 客户端的 `base_url` 配置为：
@@ -158,6 +176,7 @@ Invoke-WebRequest http://localhost:8787/api/chat `
 ```powershell
 npm run check
 npm test
+npm run inspect:upstream
 ```
 
 测试套件使用本地 mock 上游，不会请求真实的 Macaron 预览服务。
@@ -166,4 +185,4 @@ npm test
 
 目标站点的接口属于页面内部接口。如果 Macaron 预览站未来调整 bundle、端点或事件格式，这个代理也需要同步更新。
 
-当前项目实现的是 OpenAI Chat Completions 兼容层，不是完整的 Responses API。
+当前项目实现的是 OpenAI Chat Completions 兼容层，不是完整的 Responses API。流式响应在上游报错时会在 chunk 中附带 `error` 字段，并以合法的 `finish_reason`（`stop`）结束，以兼容严格校验的 OpenAI 客户端。

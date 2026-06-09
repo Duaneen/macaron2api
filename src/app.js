@@ -1,6 +1,6 @@
 import http from "node:http";
 import { once } from "node:events";
-import { randomUUID } from "node:crypto";
+import { randomUUID, timingSafeEqual } from "node:crypto";
 
 export const DEFAULT_ORIGIN = "https://macaron-model-previews.macaron.im";
 export const DEFAULT_MODEL = "macaron-v1-preview-b200";
@@ -38,6 +38,8 @@ export const MODEL_ALIASES = {
   "macaron-v1-preview-latest": DEFAULT_MODEL,
 };
 
+const MACARON_REASONING = ["enabled", "none"];
+
 const REASONING_OPTIONS = {
   "pa/gemini-3.5-flash": ["minimal", "low", "medium", "high"],
   "pa/gemini-3.1-pro-preview": ["minimal", "low", "medium", "high"],
@@ -55,10 +57,8 @@ const REASONING_OPTIONS = {
   "gpt-5.5": ["low", "medium", "high", "xhigh"],
   "gpt-5.4-mini": ["low", "medium", "high", "xhigh"],
   "gpt-5.3-codex-spark": ["low", "medium", "high", "xhigh"],
-  "macaron-v1-preview-tilert": ["enabled", "none"],
-  "macaron-v1-preview-b200": ["enabled", "none"],
-  "macaron-v1-preview-sglang": ["enabled", "none"],
-  "macaron-v1-preview-baseline": ["enabled", "none"],
+  // Macaron preview models all share the same reasoning toggle.
+  ...Object.fromEntries([...MACARON_MODELS].map((model) => [model, MACARON_REASONING])),
 };
 
 export function loadConfig(env = process.env) {
@@ -157,6 +157,7 @@ async function handleRequest(req, res, config) {
     if (req.method !== "POST") return sendMethodNotAllowed(res, ["POST"]);
     if (!isAuthorized(req, config)) return sendUnauthorized(res);
     const body = await readJson(req, config);
+    if (body.messages !== undefined) validateMessages(body.messages, { requireNonEmpty: false });
     await handleRawChat(req, res, body, config);
     return;
   }
@@ -178,6 +179,7 @@ async function handleChatCompletions(req, res, body, config) {
 
   try {
     const upstream = await callMacaron(model, targetBody, req, config, requestContext.signal);
+    setUpstreamHeader(res, upstream);
 
     if (!upstream.ok) {
       await sendUpstreamError(res, upstream, model);
@@ -220,6 +222,7 @@ async function handleRawChat(req, res, body, config) {
 
   try {
     const upstream = await callMacaron(model, targetBody, req, config, requestContext.signal);
+    setUpstreamHeader(res, upstream);
 
     if (!upstream.ok) {
       await sendUpstreamError(res, upstream, model);
@@ -229,7 +232,6 @@ async function handleRawChat(req, res, body, config) {
     res.writeHead(200, {
       "content-type": "application/x-ndjson; charset=utf-8",
       "cache-control": "no-cache",
-      "x-macaron-upstream": upstream.url,
     });
 
     await pipeReadableStream(upstream.body, res);
@@ -243,13 +245,37 @@ function validateChatCompletionRequest(body) {
     throw httpError(400, "Request body must be a JSON object.");
   }
 
-  if (!Array.isArray(body.messages) || body.messages.length === 0) {
-    throw httpError(400, "`messages` must be a non-empty array.");
-  }
+  validateMessages(body.messages, { requireNonEmpty: true });
 
   if (body.stream !== undefined && typeof body.stream !== "boolean") {
     throw httpError(400, "`stream` must be a boolean when provided.");
   }
+}
+
+function validateMessages(messages, options = {}) {
+  const requireNonEmpty = options.requireNonEmpty ?? true;
+
+  if (!Array.isArray(messages) || (requireNonEmpty && messages.length === 0)) {
+    throw httpError(400, requireNonEmpty ? "`messages` must be a non-empty array." : "`messages` must be an array.");
+  }
+
+  for (const [index, message] of messages.entries()) {
+    if (!message || typeof message !== "object" || Array.isArray(message)) {
+      throw httpError(400, `messages[${index}] must be an object.`);
+    }
+
+    if (message.role !== undefined && typeof message.role !== "string") {
+      throw httpError(400, `messages[${index}].role must be a string when provided.`);
+    }
+
+    if (!isValidMessageContent(message.content)) {
+      throw httpError(400, `messages[${index}].content must be a string, array, or null when provided.`);
+    }
+  }
+}
+
+function isValidMessageContent(content) {
+  return content === undefined || content === null || typeof content === "string" || Array.isArray(content);
 }
 
 function toMacaronRequest(body, model, req, config) {
@@ -274,7 +300,30 @@ function toMacaronRequest(body, model, req, config) {
     ...(systemPrompt ? { systemPrompt } : {}),
     ...(body.previews ? { previews: body.previews } : {}),
     ...(body.editPreviewId ? { editPreviewId: body.editPreviewId } : {}),
+    ...pickPassthroughParams(body),
   };
+}
+
+// OpenAI sampling/tool params forwarded to the upstream as-is. Whether they take
+// effect depends on the upstream; unknown fields are expected to be ignored.
+const PASSTHROUGH_PARAMS = [
+  "temperature",
+  "top_p",
+  "max_tokens",
+  "stop",
+  "frequency_penalty",
+  "presence_penalty",
+  "seed",
+  "tools",
+  "tool_choice",
+];
+
+function pickPassthroughParams(body) {
+  const out = {};
+  for (const key of PASSTHROUGH_PARAMS) {
+    if (body[key] !== undefined) out[key] = body[key];
+  }
+  return out;
 }
 
 export function normalizeMessages(messages) {
@@ -357,9 +406,14 @@ async function callMacaron(model, body, req, config, signal) {
   } catch (error) {
     if (signal?.aborted) {
       const reason = signal.reason;
-      throw httpError(reason?.status || 504, reason?.message || "Macaron upstream request aborted.");
+      throw httpError(
+        reason?.status || 504,
+        reason?.message || "Macaron upstream request aborted.",
+        reason?.type || "upstream_error",
+      );
     }
-    throw error;
+    const message = error instanceof Error ? error.message : String(error);
+    throw httpError(502, `Macaron upstream request failed: ${message}`, "upstream_error");
   }
 }
 
@@ -375,7 +429,6 @@ async function streamOpenAiResponse(res, upstream, meta) {
   writeSse(res, makeChunk(meta, { role: "assistant" }, null));
 
   let usage = null;
-  let finishReason = "stop";
 
   try {
     for await (const event of parseNdjson(upstream.body)) {
@@ -386,13 +439,8 @@ async function streamOpenAiResponse(res, upstream, meta) {
       } else if (event.type === "step-finish") {
         usage = toOpenAiUsage(event.usage);
       } else if (event.type === "error") {
-        finishReason = "error";
         writeSse(res, {
-          id: meta.id,
-          object: "chat.completion.chunk",
-          created: meta.created,
-          model: meta.model,
-          choices: [{ index: 0, delta: {}, finish_reason: "error" }],
+          ...makeChunk(meta, {}, null),
           error: {
             message: event.error || event.message || "Macaron upstream error.",
             type: "upstream_error",
@@ -404,13 +452,8 @@ async function streamOpenAiResponse(res, upstream, meta) {
       }
     }
   } catch (error) {
-    finishReason = "error";
     writeSse(res, {
-      id: meta.id,
-      object: "chat.completion.chunk",
-      created: meta.created,
-      model: meta.model,
-      choices: [{ index: 0, delta: {}, finish_reason: "error" }],
+      ...makeChunk(meta, {}, null),
       error: {
         message: error instanceof Error ? error.message : String(error),
         type: "stream_error",
@@ -419,7 +462,7 @@ async function streamOpenAiResponse(res, upstream, meta) {
   }
 
   writeSse(res, {
-    ...makeChunk(meta, {}, finishReason),
+    ...makeChunk(meta, {}, "stop"),
     ...(usage ? { usage } : {}),
   });
 
@@ -442,7 +485,7 @@ async function collectMacaronEvents(upstream) {
     } else if (event.type === "step-finish") {
       usage = event.usage || usage;
     } else if (event.type === "error") {
-      throw httpError(502, event.error || event.message || "Macaron upstream error.");
+      throw httpError(502, event.error || event.message || "Macaron upstream error.", "upstream_error");
     }
   }
 
@@ -450,7 +493,7 @@ async function collectMacaronEvents(upstream) {
 }
 
 export async function* parseNdjson(stream) {
-  if (!stream) throw httpError(502, "Upstream response did not include a body.");
+  if (!stream) throw httpError(502, "Upstream response did not include a body.", "upstream_error");
 
   const reader = stream.getReader();
   const decoder = new TextDecoder();
@@ -479,7 +522,7 @@ function parseNdjsonLine(line) {
   try {
     return JSON.parse(line);
   } catch {
-    throw httpError(502, `Invalid NDJSON from upstream: ${line.slice(0, 160)}`);
+    throw httpError(502, `Invalid NDJSON from upstream: ${line.slice(0, 160)}`, "upstream_error");
   }
 }
 
@@ -566,22 +609,33 @@ async function readJson(req, config) {
 function readText(req, maxBodyBytes) {
   return new Promise((resolve, reject) => {
     let body = "";
+    let bodyBytes = 0;
     let settled = false;
 
     req.setEncoding("utf8");
     req.on("data", (chunk) => {
-      body += chunk;
-      if (!settled && body.length > maxBodyBytes) {
+      if (settled) return;
+      bodyBytes += Buffer.byteLength(chunk, "utf8");
+      if (bodyBytes > maxBodyBytes) {
         settled = true;
         reject(httpError(413, `Request body is too large. Limit is ${maxBodyBytes} bytes.`));
-        req.destroy();
+        req.resume();
+        return;
       }
+
+      body += chunk;
     });
     req.on("end", () => {
-      if (!settled) resolve(body);
+      if (!settled) {
+        settled = true;
+        resolve(body);
+      }
     });
     req.on("error", (error) => {
-      if (!settled) reject(error);
+      if (!settled) {
+        settled = true;
+        reject(error);
+      }
     });
   });
 }
@@ -590,12 +644,12 @@ function createUpstreamContext(res, config) {
   const controller = new AbortController();
 
   const timeout = setTimeout(() => {
-    controller.abort(httpError(504, `Macaron upstream timed out after ${config.requestTimeoutMs}ms.`));
+    controller.abort(httpError(504, `Macaron upstream timed out after ${config.requestTimeoutMs}ms.`, "upstream_error"));
   }, config.requestTimeoutMs);
 
   const onClose = () => {
     if (!res.writableEnded) {
-      controller.abort(httpError(499, "Client connection closed before upstream finished."));
+      controller.abort(httpError(499, "Client connection closed before upstream finished.", "client_closed"));
     }
   };
 
@@ -632,9 +686,17 @@ function modelObject(id) {
 
 function isAuthorized(req, config) {
   if (!config.localApiKey) return true;
-  const auth = req.headers.authorization || "";
+  const auth = headerValue(req, "authorization");
   const token = auth.startsWith("Bearer ") ? auth.slice(7) : "";
-  return token === config.localApiKey || req.headers["x-api-key"] === config.localApiKey;
+  const headerKey = headerValue(req, "x-api-key");
+  return safeEqual(token, config.localApiKey) || safeEqual(headerKey, config.localApiKey);
+}
+
+function safeEqual(provided, expected) {
+  const a = Buffer.from(String(provided));
+  const b = Buffer.from(String(expected));
+  if (a.length !== b.length) return false;
+  return timingSafeEqual(a, b);
 }
 
 function sendUnauthorized(res) {
@@ -666,7 +728,7 @@ function sendThrownError(res, error) {
   sendJson(res, status, {
     error: {
       message: error instanceof Error ? error.message : String(error),
-      type: status >= 500 ? "server_error" : "invalid_request_error",
+      type: error?.type || (status >= 500 ? "server_error" : "invalid_request_error"),
     },
   });
 }
@@ -697,8 +759,13 @@ function setCorsHeaders(res, config) {
   res.setHeader("access-control-allow-methods", "GET,POST,OPTIONS");
   res.setHeader(
     "access-control-allow-headers",
-    "authorization,content-type,x-api-key,x-macaron-upstream-api-key,x-macaron-upstream-base-url",
+    "authorization,content-type,x-api-key,x-request-id,x-macaron-upstream-api-key,x-macaron-upstream-base-url",
   );
+  res.setHeader("access-control-expose-headers", "x-request-id,x-macaron-upstream");
+}
+
+function setUpstreamHeader(res, upstream) {
+  if (upstream?.url) res.setHeader("x-macaron-upstream", upstream.url);
 }
 
 function normalizeConfig(configInput) {
@@ -730,9 +797,10 @@ function headerValue(req, name) {
   return Array.isArray(value) ? value[0] : value || "";
 }
 
-function httpError(status, message) {
+function httpError(status, message, type) {
   const error = new Error(message);
   error.status = status;
+  if (type) error.type = type;
   return error;
 }
 
