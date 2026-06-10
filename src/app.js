@@ -1,6 +1,7 @@
 import http from "node:http";
 import { once } from "node:events";
 import { randomUUID, timingSafeEqual } from "node:crypto";
+import { browserFetch } from "./browser-transport.js";
 
 export const DEFAULT_ORIGIN = "https://macaron-model-previews.macaron.im";
 export const DEFAULT_MODEL = "macaron-v1-preview-b200";
@@ -68,12 +69,17 @@ export function loadConfig(env = process.env) {
     localApiKey: env.API_KEY || "",
     upstreamApiKey: env.MACARON_UPSTREAM_API_KEY || "",
     upstreamBaseUrl: env.MACARON_UPSTREAM_BASE_URL || "",
+    upstreamTransport: env.MACARON_UPSTREAM_TRANSPORT || "auto",
     requestTimeoutMs: parsePositiveInteger(env.MACARON_TIMEOUT_MS, 120000),
     maxBodyBytes: parsePositiveInteger(env.MACARON_MAX_BODY_BYTES, 20 * 1024 * 1024),
     corsAllowOrigin: env.CORS_ALLOW_ORIGIN || "*",
     allowUnknownModels: parseBoolean(env.MACARON_ALLOW_UNKNOWN_MODELS),
     defaultModel: env.MACARON_DEFAULT_MODEL || DEFAULT_MODEL,
     logRequests: env.LOG_REQUESTS !== "0",
+    browserExecutable: env.MACARON_BROWSER_EXECUTABLE || "",
+    browserUserDataDir: env.MACARON_BROWSER_USER_DATA_DIR || "",
+    browserHeadless: parseBooleanDefault(env.MACARON_BROWSER_HEADLESS, true),
+    browserStartupTimeoutMs: parsePositiveInteger(env.MACARON_BROWSER_STARTUP_TIMEOUT_MS, 30000),
     fetchImpl: globalThis.fetch,
   };
 }
@@ -390,18 +396,17 @@ async function callMacaron(model, body, req, config, signal) {
   const url = `${config.upstreamOrigin}${endpoint}`;
 
   try {
-    const upstream = await config.fetchImpl(url, {
-      method: "POST",
-      headers: {
-        "content-type": "application/json",
-        accept: "application/x-ndjson, application/json, */*",
-        "user-agent": req.headers["user-agent"] || "macaron-model2api/0.2",
-      },
-      body: JSON.stringify(body),
-      signal,
-    });
+    if (config.upstreamTransport === "browser") {
+      return await callMacaronWithBrowser(url, body, config, signal);
+    }
 
-    Object.defineProperty(upstream, "url", { value: url });
+    const upstream = await callMacaronDirect(url, body, req, config, signal);
+
+    if (config.upstreamTransport === "auto" && isVercelChallenge(upstream)) {
+      await cancelResponseBody(upstream);
+      return await callMacaronWithBrowser(url, body, config, signal);
+    }
+
     return upstream;
   } catch (error) {
     if (signal?.aborted) {
@@ -415,6 +420,47 @@ async function callMacaron(model, body, req, config, signal) {
     const message = error instanceof Error ? error.message : String(error);
     throw httpError(502, `Macaron upstream request failed: ${message}`, "upstream_error");
   }
+}
+
+async function callMacaronDirect(url, body, req, config, signal) {
+  const upstream = await config.fetchImpl(url, {
+    method: "POST",
+    headers: {
+      "content-type": "application/json",
+      accept: "*/*",
+      "user-agent":
+        req.headers["user-agent"] ||
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36",
+      "sec-ch-ua": '"Chromium";v="148", "Google Chrome";v="148", "Not/A)Brand";v="99"',
+      "sec-ch-ua-mobile": "?0",
+      "sec-ch-ua-platform": '"Windows"',
+      referer: `${config.upstreamOrigin}/`,
+    },
+    body: JSON.stringify(body),
+    signal,
+  });
+
+  Object.defineProperty(upstream, "url", { value: url });
+  return upstream;
+}
+
+async function callMacaronWithBrowser(url, body, config, signal) {
+  if (signal?.aborted) throw signal.reason || httpError(499, "Client connection closed before upstream finished.");
+
+  const init = {
+    method: "POST",
+    body: JSON.stringify(body),
+    timeoutMs: config.requestTimeoutMs,
+    signal,
+  };
+  const fetchViaBrowser =
+    typeof config.browserTransport === "function" ? config.browserTransport : config.browserTransport?.fetch;
+  const upstream = fetchViaBrowser
+    ? await fetchViaBrowser(url, init, config)
+    : await browserFetch(url, init, config);
+
+  Object.defineProperty(upstream, "url", { value: url });
+  return upstream;
 }
 
 async function streamOpenAiResponse(res, upstream, meta) {
@@ -549,6 +595,22 @@ function writeSse(res, payload) {
 }
 
 async function sendUpstreamError(res, upstream, model) {
+  setRetryAfterHeader(res, upstream);
+
+  if (isVercelChallenge(upstream)) {
+    sendJson(res, upstream.status || 429, {
+      error: {
+        message:
+          "Macaron upstream is behind Vercel Security Checkpoint. Direct server-to-server requests were challenged; enable browser upstream transport or use an owner-provided Vercel bypass.",
+        type: "rate_limit_error",
+        code: upstream.status || 429,
+        model,
+        vercel_mitigated: responseHeader(upstream, "x-vercel-mitigated") || "challenge",
+      },
+    });
+    return;
+  }
+
   const text = await upstream.text().catch(() => "");
   sendJson(res, upstream.status || 502, {
     error: {
@@ -761,7 +823,7 @@ function setCorsHeaders(res, config) {
     "access-control-allow-headers",
     "authorization,content-type,x-api-key,x-request-id,x-macaron-upstream-api-key,x-macaron-upstream-base-url",
   );
-  res.setHeader("access-control-expose-headers", "x-request-id,x-macaron-upstream");
+  res.setHeader("access-control-expose-headers", "x-request-id,x-macaron-upstream,retry-after");
 }
 
 function setUpstreamHeader(res, upstream) {
@@ -777,8 +839,14 @@ function normalizeConfig(configInput) {
 
   config.upstreamOrigin = stripTrailingSlash(config.upstreamOrigin || DEFAULT_ORIGIN);
   config.defaultModel = MODEL_ALIASES[config.defaultModel] || config.defaultModel || DEFAULT_MODEL;
+  config.upstreamTransport = normalizeUpstreamTransport(config.upstreamTransport);
   config.requestTimeoutMs = parsePositiveInteger(config.requestTimeoutMs, defaults.requestTimeoutMs);
   config.maxBodyBytes = parsePositiveInteger(config.maxBodyBytes, defaults.maxBodyBytes);
+  config.browserHeadless = parseBooleanDefault(config.browserHeadless, defaults.browserHeadless);
+  config.browserStartupTimeoutMs = parsePositiveInteger(
+    config.browserStartupTimeoutMs,
+    defaults.browserStartupTimeoutMs,
+  );
   config.fetchImpl = config.fetchImpl || globalThis.fetch;
 
   if (!config.fetchImpl) {
@@ -795,6 +863,26 @@ function getRequestId(req) {
 function headerValue(req, name) {
   const value = req.headers[name];
   return Array.isArray(value) ? value[0] : value || "";
+}
+
+function responseHeader(response, name) {
+  return response?.headers?.get?.(name) || "";
+}
+
+function isVercelChallenge(response) {
+  return (
+    String(responseHeader(response, "x-vercel-mitigated")).toLowerCase() === "challenge" ||
+    Boolean(responseHeader(response, "x-vercel-challenge-token"))
+  );
+}
+
+async function cancelResponseBody(response) {
+  await response?.body?.cancel?.().catch(() => {});
+}
+
+function setRetryAfterHeader(res, upstream) {
+  const retryAfter = responseHeader(upstream, "retry-after");
+  if (retryAfter) res.setHeader("retry-after", retryAfter);
 }
 
 function httpError(status, message, type) {
@@ -817,6 +905,18 @@ function parsePositiveInteger(value, fallback) {
 function parseBoolean(value) {
   if (value == null || value === "") return false;
   return ["1", "true", "yes", "on"].includes(String(value).toLowerCase());
+}
+
+function parseBooleanDefault(value, fallback) {
+  if (value == null || value === "") return fallback;
+  if (typeof value === "boolean") return value;
+  return ["1", "true", "yes", "on"].includes(String(value).toLowerCase());
+}
+
+function normalizeUpstreamTransport(value) {
+  const transport = String(value || "auto").toLowerCase();
+  if (["auto", "direct", "browser"].includes(transport)) return transport;
+  return "auto";
 }
 
 function stripTrailingSlash(value) {

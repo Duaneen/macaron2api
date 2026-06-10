@@ -28,6 +28,65 @@ http://localhost:8787
 
 如果需要固定本地配置，可以参考 `.env.example`。不配置 `.env` 也可以直接运行。
 
+## Docker 部署
+
+先生成本地环境配置，并按需修改 `API_KEY`：
+
+```powershell
+Copy-Item .env.example .env
+```
+
+### Docker Compose
+
+推荐使用 Compose 部署：
+
+```powershell
+docker compose up -d --build
+```
+
+默认会把宿主机 `8787` 端口映射到容器内服务。需要改宿主机端口时，修改 `.env` 中的 `HOST_PORT`：
+
+```text
+HOST_PORT=18787
+```
+
+查看运行状态和日志：
+
+```powershell
+docker compose ps
+docker compose logs -f
+```
+
+更新镜像并重启：
+
+```powershell
+docker compose up -d --build
+```
+
+停止服务：
+
+```powershell
+docker compose down
+```
+
+### Docker CLI
+
+也可以直接构建并运行镜像：
+
+```powershell
+docker build -t macaron-model2api .
+docker run -d --name macaron-model2api --restart unless-stopped `
+  -p 8787:8787 `
+  --env-file .env `
+  macaron-model2api
+```
+
+健康检查：
+
+```powershell
+Invoke-RestMethod http://localhost:8787/health
+```
+
 ## 配置
 
 ```powershell
@@ -35,8 +94,10 @@ $env:PORT = "8787"
 $env:API_KEY = "local-secret"
 $env:MACARON_ORIGIN = "https://macaron-model-previews.macaron.im"
 $env:MACARON_DEFAULT_MODEL = "macaron-v1-preview-b200"
+$env:MACARON_UPSTREAM_TRANSPORT = "auto"
 $env:MACARON_TIMEOUT_MS = "120000"
 $env:MACARON_ALLOW_UNKNOWN_MODELS = "0"
+$env:MACARON_BROWSER_EXECUTABLE = ""
 $env:CORS_ALLOW_ORIGIN = "*"
 npm start
 ```
@@ -68,6 +129,30 @@ x-api-key: local-secret
 x-macaron-upstream-api-key
 x-macaron-upstream-base-url
 ```
+
+### Vercel 429 / Security Checkpoint
+
+jshook inspection shows that direct server-to-server replay of `/api/inline-chat`
+returns `429 Too Many Requests` with `x-vercel-mitigated: challenge` and the
+`Vercel Security Checkpoint` HTML page, while a real browser page request works.
+
+`MACARON_UPSTREAM_TRANSPORT` controls this behavior:
+
+- `auto` tries direct Node fetch first, then falls back to a real browser context
+  only when Vercel returns a challenge.
+- `browser` always sends upstream requests from a browser context.
+- `direct` never starts a browser and will surface the Vercel challenge as a
+  `rate_limit_error`.
+
+For local runs, install Chrome or Edge if auto fallback reports that no browser
+was found, or set:
+
+```powershell
+$env:MACARON_BROWSER_EXECUTABLE = "C:\Program Files\Google\Chrome\Application\chrome.exe"
+```
+
+The Docker image installs Chromium and defaults
+`MACARON_BROWSER_EXECUTABLE=/usr/bin/chromium-browser`.
 
 ## 参数透传
 

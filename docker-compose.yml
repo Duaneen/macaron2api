@@ -1,0 +1,36 @@
+services:
+  macaron-model2api:
+    build:
+      context: .
+    image: macaron-model2api:latest
+    restart: unless-stopped
+    init: true
+    ports:
+      - "${HOST_PORT:-8787}:8787"
+    environment:
+      PORT: "8787"
+      API_KEY: "${API_KEY:-}"
+      MACARON_ORIGIN: "${MACARON_ORIGIN:-https://macaron-model-previews.macaron.im}"
+      MACARON_DEFAULT_MODEL: "${MACARON_DEFAULT_MODEL:-macaron-v1-preview-b200}"
+      MACARON_UPSTREAM_TRANSPORT: "${MACARON_UPSTREAM_TRANSPORT:-auto}"
+      MACARON_TIMEOUT_MS: "${MACARON_TIMEOUT_MS:-120000}"
+      MACARON_MAX_BODY_BYTES: "${MACARON_MAX_BODY_BYTES:-20971520}"
+      MACARON_ALLOW_UNKNOWN_MODELS: "${MACARON_ALLOW_UNKNOWN_MODELS:-0}"
+      MACARON_BROWSER_EXECUTABLE: "${MACARON_BROWSER_EXECUTABLE:-}"
+      MACARON_BROWSER_USER_DATA_DIR: "${MACARON_BROWSER_USER_DATA_DIR:-}"
+      MACARON_BROWSER_HEADLESS: "${MACARON_BROWSER_HEADLESS:-1}"
+      MACARON_BROWSER_STARTUP_TIMEOUT_MS: "${MACARON_BROWSER_STARTUP_TIMEOUT_MS:-30000}"
+      MACARON_UPSTREAM_API_KEY: "${MACARON_UPSTREAM_API_KEY:-}"
+      MACARON_UPSTREAM_BASE_URL: "${MACARON_UPSTREAM_BASE_URL:-}"
+      CORS_ALLOW_ORIGIN: "${CORS_ALLOW_ORIGIN:-*}"
+      LOG_REQUESTS: "${LOG_REQUESTS:-1}"
+    healthcheck:
+      test:
+        - CMD
+        - node
+        - -e
+        - fetch('http://127.0.0.1:8787/health').then((r) => process.exit(r.ok ? 0 : 1)).catch(() => process.exit(1))
+      interval: 30s
+      timeout: 5s
+      start_period: 10s
+      retries: 3

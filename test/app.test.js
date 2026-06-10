@@ -308,6 +308,108 @@ test("reports upstream fetch failures as upstream errors", async () => {
   }
 });
 
+test("falls back to browser transport for Vercel security checkpoint responses", async () => {
+  let directCalls = 0;
+  let browserCalls = 0;
+  let browserInit = null;
+  const app = await startApp("https://macaron-model-previews.macaron.im", {
+    localApiKey: "test-secret",
+    upstreamTransport: "auto",
+    fetchImpl: async () => {
+      directCalls += 1;
+      return new Response("<html>Vercel Security Checkpoint</html>", {
+        status: 429,
+        statusText: "Too Many Requests",
+        headers: {
+          "content-type": "text/html; charset=utf-8",
+          server: "Vercel",
+          "x-vercel-mitigated": "challenge",
+        },
+      });
+    },
+    browserTransport: {
+      fetch: async (url, init) => {
+        browserCalls += 1;
+        browserInit = { url, ...init };
+        return new Response(
+          [
+            JSON.stringify({ type: "text-delta", text: "Hello through browser." }),
+            JSON.stringify({ type: "step-finish", usage: { inputTokens: 2, outputTokens: 3, totalTokens: 5 } }),
+            JSON.stringify({ type: "done" }),
+            "",
+          ].join("\n"),
+          {
+            status: 200,
+            headers: { "content-type": "application/x-ndjson; charset=utf-8" },
+          },
+        );
+      },
+    },
+  });
+
+  try {
+    const res = await fetch(`${app.origin}/v1/chat/completions`, {
+      method: "POST",
+      headers: { ...AUTH, "content-type": "application/json" },
+      body: JSON.stringify({
+        model: "macaron-v1-preview-b200",
+        messages: [{ role: "user", content: "hello" }],
+      }),
+    });
+    const body = await res.json();
+
+    assert.equal(res.status, 200);
+    assert.equal(body.choices[0].message.content, "Hello through browser.");
+    assert.deepEqual(body.usage, {
+      prompt_tokens: 2,
+      completion_tokens: 3,
+      total_tokens: 5,
+    });
+    assert.equal(directCalls, 1);
+    assert.equal(browserCalls, 1);
+    assert.equal(browserInit.url, "https://macaron-model-previews.macaron.im/api/inline-chat");
+    assert.match(browserInit.body, /macaron-v1-preview-b200/);
+  } finally {
+    await app.close();
+  }
+});
+
+test("reports Vercel security checkpoint when browser fallback is disabled", async () => {
+  const app = await startApp("https://macaron-model-previews.macaron.im", {
+    localApiKey: "test-secret",
+    upstreamTransport: "direct",
+    fetchImpl: async () =>
+      new Response("<html>Vercel Security Checkpoint</html>", {
+        status: 429,
+        statusText: "Too Many Requests",
+        headers: {
+          "retry-after": "60",
+          "x-vercel-mitigated": "challenge",
+        },
+      }),
+  });
+
+  try {
+    const res = await fetch(`${app.origin}/v1/chat/completions`, {
+      method: "POST",
+      headers: { ...AUTH, "content-type": "application/json" },
+      body: JSON.stringify({
+        model: "macaron-v1-preview-b200",
+        messages: [{ role: "user", content: "hello" }],
+      }),
+    });
+    const body = await res.json();
+
+    assert.equal(res.status, 429);
+    assert.equal(res.headers.get("retry-after"), "60");
+    assert.equal(body.error.type, "rate_limit_error");
+    assert.equal(body.error.vercel_mitigated, "challenge");
+    assert.match(body.error.message, /Vercel Security Checkpoint/);
+  } finally {
+    await app.close();
+  }
+});
+
 test("reports malformed upstream NDJSON as upstream errors", async () => {
   const upstream = await startMockUpstream({ rawResponse: "not-json\n" });
   const app = await startApp(upstream.origin, { localApiKey: "test-secret" });
