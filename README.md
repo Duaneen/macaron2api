@@ -1,8 +1,8 @@
-# Macaron Model2API
+# OpenAI 兼容 API 网关
 
-这是一个面向 `https://macaron-model-previews.macaron.im/` 的 OpenAI 兼容 API 代理。
+> 中文 | [English](README.en.md)
 
-它会把 Macaron 预览站点里的聊天后端封装成本地 OpenAI 风格接口，同时保留一个原始 Macaron NDJSON 代理接口，方便调试上游事件流。
+一个自托管的、OpenAI 兼容的 API 代理服务。它把上游模型服务封装为标准的 OpenAI Chat Completions 接口，并额外保留一个透传上游原始事件流的调试接口。
 
 ## 功能
 
@@ -10,9 +10,9 @@
 - `GET /v1/models`
 - `GET /v1/models/{model}`
 - `POST /v1/chat/completions`
-- `POST /api/chat` 原始 Macaron NDJSON 代理
+- `POST /api/chat`：透传上游原始 NDJSON 事件流，便于调试
 
-Macaron 预览模型会路由到上游 `/api/inline-chat`。其它从预览站点提取出来的模型会路由到上游 `/api/plain-chat`。
+不同模型会按内部规则路由到对应的上游接口。
 
 ## 启动
 
@@ -26,7 +26,7 @@ npm start
 http://localhost:8787
 ```
 
-如果需要固定本地配置，可以参考 `.env.example`。不配置 `.env` 也可以直接运行。
+如需固定本地配置，可参考 `.env.example`；不配置 `.env` 也能直接运行。
 
 ## Docker 部署
 
@@ -50,14 +50,16 @@ docker compose up -d --build
 HOST_PORT=18787
 ```
 
-查看运行状态和日志：
+首次启动会在项目目录下创建 `browser-profile/`，用于持久化浏览器上下文（已在 `.gitignore` 中忽略）。
+
+查看运行状态与日志：
 
 ```powershell
 docker compose ps
 docker compose logs -f
 ```
 
-更新镜像并重启：
+更新并重启：
 
 ```powershell
 docker compose up -d --build
@@ -74,11 +76,11 @@ docker compose down
 也可以直接构建并运行镜像：
 
 ```powershell
-docker build -t macaron-model2api .
-docker run -d --name macaron-model2api --restart unless-stopped `
+docker build -t app .
+docker run -d --name app --restart unless-stopped `
   -p 8787:8787 `
   --env-file .env `
-  macaron-model2api
+  app
 ```
 
 健康检查：
@@ -89,32 +91,33 @@ Invoke-RestMethod http://localhost:8787/health
 
 ## 配置
 
-```powershell
-$env:PORT = "8787"
-$env:API_KEY = "local-secret"
-$env:MACARON_ORIGIN = "https://macaron-model-previews.macaron.im"
-$env:MACARON_DEFAULT_MODEL = "macaron-v1-preview-b200"
-$env:MACARON_UPSTREAM_TRANSPORT = "auto"
-$env:MACARON_TIMEOUT_MS = "120000"
-$env:MACARON_ALLOW_UNKNOWN_MODELS = "0"
-$env:MACARON_BROWSER_EXECUTABLE = ""
-$env:CORS_ALLOW_ORIGIN = "*"
-npm start
-```
+主要环境变量（完整项见 `.env.example`）：
 
-如果设置了 `API_KEY`，客户端请求必须携带以下任意一种认证方式：
+| 变量 | 说明 |
+| --- | --- |
+| `PORT` | 服务监听端口，默认 `8787` |
+| `API_KEY` | 客户端访问密钥，留空则不校验 |
+| `MACARON_ORIGIN` | 上游服务 Origin（默认指向官方上游） |
+| `MACARON_DEFAULT_MODEL` | 默认模型 |
+| `MACARON_UPSTREAM_TRANSPORT` | 上游传输方式：`auto` / `browser` / `direct` |
+| `MACARON_TIMEOUT_MS` | 上游请求超时（毫秒） |
+| `MACARON_BROWSER_EXECUTABLE` | 浏览器可执行文件路径 |
+| `MACARON_BROWSER_USER_AGENT` | 浏览器上下文使用的 User-Agent（可选） |
+| `CORS_ALLOW_ORIGIN` | CORS 允许来源，默认 `*` |
+
+如果设置了 `API_KEY`，客户端请求需携带任意一种认证：
 
 ```text
-Authorization: Bearer local-secret
+Authorization: Bearer <your-key>
 ```
 
 或：
 
 ```text
-x-api-key: local-secret
+x-api-key: <your-key>
 ```
 
-对于上游普通模型，可以通过环境变量或每次请求传入上游密钥和上游 base URL：
+部分上游模型支持按请求传入独立的上游密钥与 base URL：
 
 ```json
 {
@@ -123,36 +126,25 @@ x-api-key: local-secret
 }
 ```
 
-也可以使用请求头：
+也可使用请求头 `x-macaron-upstream-api-key` 与 `x-macaron-upstream-base-url`。
 
-```text
-x-macaron-upstream-api-key
-x-macaron-upstream-base-url
-```
+## 上游传输与浏览器上下文
 
-### Vercel 429 / Security Checkpoint
+部分上游对纯服务端发起的请求会返回限流或安全质询，而来自真实浏览器的请求可以正常完成。`MACARON_UPSTREAM_TRANSPORT` 用于控制这一行为：
 
-jshook inspection shows that direct server-to-server replay of `/api/inline-chat`
-returns `429 Too Many Requests` with `x-vercel-mitigated: challenge` and the
-`Vercel Security Checkpoint` HTML page, while a real browser page request works.
+- `auto`：先尝试直接的服务端请求，仅当上游返回质询时，自动回退到真实浏览器上下文。
+- `browser`：始终通过浏览器上下文发送上游请求。
+- `direct`：只用服务端请求，遇到质询会直接以错误返回。
 
-`MACARON_UPSTREAM_TRANSPORT` controls this behavior:
+浏览器上下文会以接近真实桌面浏览器的环境发起请求——统一的 User-Agent、客户端提示（Client Hints）与基础环境特征——以提升在严格风控下的成功率。可通过 `MACARON_BROWSER_USER_AGENT` 覆盖默认 UA；浏览器配置持久化在 `browser-profile/`，可跨重启复用。
 
-- `auto` tries direct Node fetch first, then falls back to a real browser context
-  only when Vercel returns a challenge.
-- `browser` always sends upstream requests from a browser context.
-- `direct` never starts a browser and will surface the Vercel challenge as a
-  `rate_limit_error`.
-
-For local runs, install Chrome or Edge if auto fallback reports that no browser
-was found, or set:
+本地运行若提示找不到浏览器，请安装 Chrome 或 Edge，或显式指定：
 
 ```powershell
 $env:MACARON_BROWSER_EXECUTABLE = "C:\Program Files\Google\Chrome\Application\chrome.exe"
 ```
 
-The Docker image installs Chromium and defaults
-`MACARON_BROWSER_EXECUTABLE=/usr/bin/chromium-browser`.
+Docker 镜像内置 Chromium，默认 `MACARON_BROWSER_EXECUTABLE=/usr/bin/chromium-browser`。
 
 ## 参数透传
 
@@ -160,21 +152,11 @@ The Docker image installs Chromium and defaults
 
 `temperature`、`top_p`、`max_tokens`、`stop`、`frequency_penalty`、`presence_penalty`、`seed`
 
-`tools` 与 `tool_choice` 也会一并转发。但工具调用能否端到端工作，取决于上游 Macaron 接口本身是否支持函数调用，以及其返回的事件格式——当前代理只做请求侧透传，尚未对上游的工具调用返回做解析。
-
-## 上游协议逆向
-
-可以用以下命令从真实预览页面抽取当前 bundle 里的端点、模型 ID 和 NDJSON 事件类型：
-
-```powershell
-npm run inspect:upstream
-```
-
-当前页面会向 `/api/inline-chat` 与 `/api/plain-chat` 发送 JSON 请求，上游以 NDJSON 返回事件。已观察到的事件类型包括 `text-delta`、`reasoning-start`、`reasoning-delta`、`tool-input`、`tsx-preview`、`web-search`、`tool-error`、`error`、`done`。OpenAI 兼容层目前只把文本、reasoning、usage 和错误转换为 Chat Completions 形态；工具输入、TSX 预览和搜索事件仍只适合通过 `/api/chat` 原始代理观察。
+`tools` 与 `tool_choice` 也会一并转发，但工具调用能否端到端工作取决于上游是否支持；当前代理只做请求侧透传，尚未解析上游的工具调用返回。
 
 ## OpenAI 兼容用法
 
-客户端的 `base_url` 配置为：
+客户端 `base_url` 配置为：
 
 ```text
 http://localhost:8787/v1
@@ -187,7 +169,7 @@ Invoke-RestMethod http://localhost:8787/v1/chat/completions `
   -Method Post `
   -ContentType "application/json" `
   -Body '{
-    "model": "macaron-v1-preview-b200",
+    "model": "<model-id>",
     "messages": [
       { "role": "user", "content": "Say hi in one short sentence." }
     ]
@@ -201,7 +183,7 @@ Invoke-WebRequest http://localhost:8787/v1/chat/completions `
   -Method Post `
   -ContentType "application/json" `
   -Body '{
-    "model": "macaron-v1-preview-b200",
+    "model": "<model-id>",
     "stream": true,
     "messages": [
       { "role": "user", "content": "Say hi." }
@@ -209,65 +191,21 @@ Invoke-WebRequest http://localhost:8787/v1/chat/completions `
   }' | Select-Object -ExpandProperty Content
 ```
 
-原始上游 NDJSON 代理示例：
+## 模型
 
-```powershell
-Invoke-WebRequest http://localhost:8787/api/chat `
-  -Method Post `
-  -ContentType "application/json" `
-  -Body '{
-    "model": "macaron-v1-preview-b200",
-    "messages": [
-      { "role": "user", "content": "Say hi." }
-    ]
-  }' | Select-Object -ExpandProperty Content
-```
-
-## 模型列表
-
-已提取的模型 ID：
-
-- `macaron-v1-preview-sglang`
-- `macaron-v1-preview-baseline`
-- `macaron-v1-preview-b200`
-- `macaron-v1-preview-tilert`
-- `pa/gemini-3.5-flash`
-- `pa/gemini-3.1-pro-preview`
-- `pa/gpt-5.4`
-- `pa/claude-sonnet-4-6`
-- `zai-org/glm-5.1`
-- `xiaomimimo/mimo-v2.5-pro`
-- `qwen/qwen3.7-max`
-- `minimax/minimax-m2.7`
-- `deepseek/deepseek-v4-pro`
-- `kimi-k2-thinking`
-- `doubao-seed-2-0-pro-260215`
-- `zai-glm-4.7`
-- `gpt-oss-120b`
-- `gpt-5.5`
-- `gpt-5.4-mini`
-- `gpt-5.3-codex-spark`
-
-支持的模型别名：
-
-- `macaron`
-- `macaron-v1-preview`
-- `macaron-v1-preview-latest`
-
-这些别名都会解析为 `macaron-v1-preview-b200`。
+通过 `GET /v1/models` 获取当前可用模型列表；默认模型由 `MACARON_DEFAULT_MODEL` 指定，并提供若干别名解析到默认模型。
 
 ## 开发
 
 ```powershell
 npm run check
 npm test
-npm run inspect:upstream
 ```
 
-测试套件使用本地 mock 上游，不会请求真实的 Macaron 预览服务。
+测试套件使用本地 mock 上游，不会请求真实的上游服务。
 
 ## 注意事项
 
-目标站点的接口属于页面内部接口。如果 Macaron 预览站未来调整 bundle、端点或事件格式，这个代理也需要同步更新。
+本服务依赖上游接口的当前形态。若上游调整接口或事件格式，本代理需同步更新。
 
-当前项目实现的是 OpenAI Chat Completions 兼容层，不是完整的 Responses API。流式响应在上游报错时会在 chunk 中附带 `error` 字段，并以合法的 `finish_reason`（`stop`）结束，以兼容严格校验的 OpenAI 客户端。
+当前实现的是 OpenAI Chat Completions 兼容层，而非完整的 Responses API。流式响应在上游报错时会在 chunk 中附带 `error` 字段，并以合法的 `finish_reason`（`stop`）结束，以兼容严格校验的客户端。

@@ -9,6 +9,37 @@ import path from "node:path";
 
 const DEFAULT_BROWSER_STARTUP_TIMEOUT_MS = 30000;
 const DEFAULT_BROWSER_FETCH_TIMEOUT_MS = 120000;
+const DESKTOP_USER_AGENT =
+  process.env.MACARON_BROWSER_USER_AGENT ||
+  "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36";
+const DESKTOP_UA_METADATA = {
+  brands: [
+    { brand: "Chromium", version: "149" },
+    { brand: "Google Chrome", version: "149" },
+    { brand: "Not_A Brand", version: "99" },
+  ],
+  fullVersionList: [
+    { brand: "Chromium", version: "149.0.0.0" },
+    { brand: "Google Chrome", version: "149.0.0.0" },
+    { brand: "Not_A Brand", version: "99.0.0.0" },
+  ],
+  platform: "Windows",
+  platformVersion: "15.0.0",
+  architecture: "x86",
+  model: "",
+  mobile: false,
+  bitness: "64",
+  wow64: false,
+};
+const STEALTH_SCRIPT = `
+try {
+  Object.defineProperty(navigator, "webdriver", { get: () => undefined });
+  Object.defineProperty(navigator, "languages", { get: () => ["en-US", "en"] });
+  Object.defineProperty(navigator, "platform", { get: () => "Win32" });
+  Object.defineProperty(navigator, "plugins", { get: () => [1, 2, 3, 4, 5] });
+  window.chrome = window.chrome || { runtime: {} };
+} catch {}
+`;
 const transports = new Map();
 
 export async function browserFetch(url, init = {}, config = {}) {
@@ -122,11 +153,13 @@ class BrowserTransport {
       "--disable-component-extensions-with-background-pages",
       "--disable-dev-shm-usage",
       "--disable-blink-features=AutomationControlled",
+      "--lang=en-US,en",
+      `--user-agent=${DESKTOP_USER_AGENT}`,
       "--window-size=1280,900",
     ];
 
     if (this.options.headless !== false) args.push("--headless=new");
-    args.push(this.options.origin);
+    args.push("about:blank");
 
     const child = spawn(executable, args, {
       stdio: ["ignore", "ignore", "pipe"],
@@ -140,9 +173,10 @@ class BrowserTransport {
     });
 
     const port = await waitForDevToolsPort(userDataDir, child, this.options.startupTimeoutMs, () => stderr);
-    const target = await createPageTarget(port, this.options.origin);
+    const target = await createPageTarget(port, "about:blank");
     const cdp = await CdpConnection.connect(target.webSocketDebuggerUrl, this.options.startupTimeoutMs);
 
+    await preparePageForCheckpoint(cdp);
     await cdp.send("Runtime.enable", {}, 5000);
     await cdp.send("Page.enable", {}, 5000).catch(() => {});
     await cdp.send("Page.navigate", { url: this.options.origin }, 5000).catch(() => {});
@@ -150,6 +184,23 @@ class BrowserTransport {
 
     return { cdp, child, userDataDir };
   }
+}
+
+async function preparePageForCheckpoint(cdp) {
+  await cdp.send("Network.enable", {}, 5000).catch(() => {});
+  await cdp
+    .send(
+      "Network.setUserAgentOverride",
+      {
+        userAgent: DESKTOP_USER_AGENT,
+        acceptLanguage: "en-US,en;q=0.9",
+        platform: "Windows",
+        userAgentMetadata: DESKTOP_UA_METADATA,
+      },
+      5000,
+    )
+    .catch(() => {});
+  await cdp.send("Page.addScriptToEvaluateOnNewDocument", { source: STEALTH_SCRIPT }, 5000).catch(() => {});
 }
 
 async function browserFetchInPage(url, body, timeoutMs) {

@@ -24,12 +24,14 @@ services:
       MACARON_UPSTREAM_BASE_URL: "${MACARON_UPSTREAM_BASE_URL:-}"
       CORS_ALLOW_ORIGIN: "${CORS_ALLOW_ORIGIN:-*}"
       LOG_REQUESTS: "${LOG_REQUESTS:-1}"
+    volumes:
+      - ./browser-profile:/tmp/macaron-browser-profile
     healthcheck:
       test:
         - CMD
         - node
         - -e
-        - fetch('http://127.0.0.1:8787/health').then((r) => process.exit(r.ok ? 0 : 1)).catch(() => process.exit(1))
+        - "fetch('http://127.0.0.1:8787/health').then((r) => process.exit(r.ok ? 0 : 1)).catch(() => process.exit(1))"
       interval: 30s
       timeout: 5s
       start_period: 10s
